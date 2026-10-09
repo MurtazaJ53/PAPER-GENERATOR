@@ -9,6 +9,50 @@ if (!process.env.API_KEY) {
 
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
+// Models tried in order. Gemini often returns 503 "high demand" or 429 for a
+// busy model, so retry briefly, then fall back to the next model.
+const MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash"];
+const RETRIES_PER_MODEL = 2;
+
+const isRetryable = (error: unknown) =>
+    /\b(429|500|503|504)\b|UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand|fetch failed|network/i
+        .test(error instanceof Error ? error.message : String(error));
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+type GenerateParams = Parameters<typeof ai.models.generateContent>[0];
+
+const generateWithFallback = async (params: Omit<GenerateParams, 'model'>) => {
+    let lastError: unknown;
+    for (const model of MODELS) {
+        for (let attempt = 0; attempt <= RETRIES_PER_MODEL; attempt++) {
+            try {
+                return await ai.models.generateContent({ ...params, model });
+            } catch (error) {
+                lastError = error;
+                console.warn(`Gemini ${model} attempt ${attempt + 1} failed:`, error);
+                if (!isRetryable(error)) throw error;
+                if (attempt < RETRIES_PER_MODEL) await sleep(1000 * 2 ** attempt);
+            }
+        }
+    }
+    throw lastError;
+};
+
+const describeApiError = (error: unknown): string | null => {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/API_KEY_INVALID|API key not valid|PERMISSION_DENIED|\b(401|403)\b/i.test(message)) {
+        return "The Gemini API key is invalid or not allowed. Check VITE_API_KEY.";
+    }
+    if (/RESOURCE_EXHAUSTED|\b429\b/i.test(message)) {
+        return "Gemini API quota exceeded. Please wait a minute and try again.";
+    }
+    if (isRetryable(error)) {
+        return "Gemini servers are busy right now. Please try again in a moment.";
+    }
+    return null;
+};
+
 // FIX: Update schema to include new question properties for richer content generation.
 const questionItemSchema = {
     type: Type.OBJECT,
@@ -66,8 +110,7 @@ export const generateQuestionPaper = async (formData: FormState): Promise<Questi
   const prompt = createGenerationPrompt(formData);
 
   try {
-    const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
+    const response = await generateWithFallback({
         contents: prompt,
         config: {
             responseMimeType: "application/json",
@@ -97,6 +140,8 @@ export const generateQuestionPaper = async (formData: FormState): Promise<Questi
     if (error instanceof Error && error.message.includes('SAFETY')) {
         throw new Error("The generation was blocked due to safety policies. Please try a different prompt.");
     }
+    const apiMessage = describeApiError(error);
+    if (apiMessage) throw new Error(apiMessage);
     if (error instanceof SyntaxError) {
         throw new Error("Failed to parse the question paper from the model. The response was not valid JSON.");
     }
@@ -113,8 +158,7 @@ export const regenerateQuestion = async (
     const prompt = createRegenerationPrompt(questionToReplace, paperContext, chapters);
 
     try {
-        const response = await ai.models.generateContent({
-            model: "gemini-3.8-flash",
+        const response = await generateWithFallback({
             contents: prompt,
             config: {
                 responseMimeType: "application/json",
@@ -135,6 +179,8 @@ export const regenerateQuestion = async (
         if (error instanceof Error && error.message.includes('SAFETY')) {
             throw new Error("The regeneration was blocked due to safety policies.");
         }
+        const apiMessage = describeApiError(error);
+        if (apiMessage) throw new Error(apiMessage);
         if (error instanceof SyntaxError) {
             throw new Error("Failed to parse the new question from the model.");
         }
