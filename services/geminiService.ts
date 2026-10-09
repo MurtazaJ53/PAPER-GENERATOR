@@ -84,7 +84,7 @@ export const generateQuestionPaper = async (formData: FormState): Promise<Questi
 
   try {
     const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
+        model: "gemini-3.8-flash",
         contents: prompt,
         config: {
             responseMimeType: "application/json",
